@@ -1,9 +1,46 @@
 # Console Music Player
 
-Player de musica pelo console no Windows que busca audio no YouTube, toca com fila e usa comandos no estilo `m!`.
-O console usa `prompt-toolkit` para manter o prompt `>` arrumado mesmo quando a musica comeca a tocar enquanto voce esta digitando.
+A Windows console music player written in Python. It searches YouTube, resolves the best matching song title, manages a playback queue, and uses simple `m!` commands inspired by chat music bots.
 
-## Instalar
+## Features
+
+- Search YouTube by song name or play from a direct URL.
+- Shows the resolved YouTube title before adding a track to the queue.
+- Queue support: add multiple songs and play them in order.
+- Skip the current track with `m!s`.
+- Quiet download/conversion output.
+- Clean interactive prompt powered by `prompt-toolkit`.
+- No `pygame` dependency.
+
+## Platform Support
+
+Playback currently works on **Windows only** because the audio backend uses Python's built-in `winsound` module.
+
+The YouTube search/download parts are cross-platform, but Linux/macOS playback would need a different audio backend such as `simpleaudio`, `sounddevice`, or `miniaudio`.
+
+## Requirements
+
+- Windows 10/11
+- Python 3.11+
+- Git
+- Internet connection
+
+Python dependencies:
+
+- `yt-dlp`
+- `imageio-ffmpeg`
+- `prompt-toolkit`
+
+## Download
+
+Clone the repository:
+
+```powershell
+git clone https://github.com/zeus123-e/musicplayer-python.git
+cd musicplayer-python
+```
+
+## Installation
 
 ```powershell
 python -m venv .venv
@@ -11,39 +48,67 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Rodar
+## Usage
 
 ```powershell
 python main.py
 ```
 
-## Comandos
+Then type commands in the console:
 
 ```text
-m!p "nome da musica"  adiciona uma musica do YouTube na fila
-m!s                   para a musica atual e pula para a proxima
-m!fila                mostra a fila
-m!limpar              limpa a fila pendente
-m!q                   sai do player
-m!help                mostra os comandos
+m!p love me not
 ```
 
-Quando voce usa `m!p`, o player procura no YouTube antes de enfileirar. Assim, mesmo se o nome estiver meio errado, ele mostra o titulo encontrado:
+Example output:
 
 ```text
-Nome certo da musica adicionado a fila (posicao 1)
+Ravyn Lenae - Love Me Not (Official Music Video) adicionado a fila (posicao 1)
+Tocando: Ravyn Lenae - Love Me Not (Official Music Video)
 ```
 
-Tambem da para usar uma URL:
+You can also use a direct YouTube URL:
 
 ```text
 m!p https://www.youtube.com/watch?v=dQw4w9WgXcQ
 ```
 
-## Testes
+## Commands
+
+| Command | Description |
+| --- | --- |
+| `m!p <song name or URL>` | Search YouTube and add the resolved track to the queue. |
+| `m!s` | Stop the current track and skip to the next one. |
+| `m!fila` | Show the current track and queued songs. |
+| `m!limpar` | Clear the pending queue without stopping the current track. |
+| `m!help` | Show available commands. |
+| `m!q` | Quit the player. |
+
+## How It Works
+
+1. `yt-dlp` searches YouTube and resolves the real video title.
+2. The selected audio is downloaded quietly.
+3. `imageio-ffmpeg` converts the audio to a temporary WAV file.
+4. `winsound` plays the WAV file.
+5. The temporary file is removed after playback.
+
+## Basic Check
 
 ```powershell
-python -m unittest discover -s tests
+python -m py_compile main.py
 ```
 
-Os testes usam downloader/player falsos, entao nao precisam baixar musica nem tocar audio.
+For a manual smoke test, start the player and run:
+
+```text
+m!help
+m!q
+```
+
+## Notes
+
+This project depends on YouTube extraction through `yt-dlp`, so availability can change if YouTube changes its site behavior. Keeping `yt-dlp` updated is recommended.
+
+```powershell
+pip install --upgrade yt-dlp
+```
