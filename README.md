@@ -1,16 +1,18 @@
 # Console Music Player
 
-A Windows console music player written in Python. It searches YouTube, resolves the best matching song title, manages a playback queue, and uses simple `m!` commands inspired by chat music bots.
+A small Windows console music player written in Python. It searches YouTube, resolves the best matching title, supports direct video links and playlist links, manages a playback queue, and uses simple `m!` commands inspired by chat music bots.
 
 ## Features
 
-- Search YouTube by song name or play from a direct URL.
-- Shows the resolved YouTube title before adding a track to the queue.
+- Search YouTube by song name and automatically use the first result.
+- Play from a direct YouTube video URL.
+- Add an entire YouTube playlist to the queue with one `m!p` command.
+- Shows the resolved YouTube title before adding tracks to the queue.
 - Queue support: add multiple songs and play them in order.
 - Skip the current track with `m!s`.
 - Quiet download/conversion output.
 - Clean interactive prompt powered by `prompt-toolkit`.
-- No `pygame` dependency.
+- No `pygame`, VLC, mpv, or ffplay dependency.
 
 ## Platform Support
 
@@ -67,17 +69,27 @@ Ravyn Lenae - Love Me Not (Official Music Video) adicionado a fila (posicao 1)
 Tocando: Ravyn Lenae - Love Me Not (Official Music Video)
 ```
 
-You can also use a direct YouTube URL:
+Play a direct video URL:
 
 ```text
 m!p https://www.youtube.com/watch?v=dQw4w9WgXcQ
 ```
 
+Add a playlist URL:
+
+```text
+m!p https://www.youtube.com/playlist?list=PLAYLIST_ID
+```
+
+For playlist links, the player adds all playlist tracks to the pending queue and keeps playback quiet.
+
 ## Commands
 
 | Command | Description |
 | --- | --- |
-| `m!p <song name or URL>` | Search YouTube and add the resolved track to the queue. |
+| `m!p <song name>` | Search YouTube and add the first result to the queue. |
+| `m!p <video URL>` | Add a direct YouTube video to the queue. |
+| `m!p <playlist URL>` | Add all videos from a YouTube playlist to the queue. |
 | `m!s` | Stop the current track and skip to the next one. |
 | `m!fila` | Show the current track and queued songs. |
 | `m!limpar` | Clear the pending queue without stopping the current track. |
@@ -86,11 +98,12 @@ m!p https://www.youtube.com/watch?v=dQw4w9WgXcQ
 
 ## How It Works
 
-1. `yt-dlp` searches YouTube and resolves the real video title.
-2. The selected audio is downloaded quietly.
-3. `imageio-ffmpeg` converts the audio to a temporary WAV file.
-4. `winsound` plays the WAV file.
-5. The temporary file is removed after playback.
+1. `yt-dlp` searches YouTube or reads the provided YouTube URL.
+2. Song searches and video links add one track; playlist links add all playlist entries.
+3. The selected audio is downloaded quietly.
+4. `imageio-ffmpeg` converts the audio to a temporary WAV file.
+5. `winsound` plays the WAV file.
+6. The temporary file is removed after playback.
 
 ## Basic Check
 
@@ -102,12 +115,14 @@ For a manual smoke test, start the player and run:
 
 ```text
 m!help
+m!p matue 333
+m!s
 m!q
 ```
 
 ## Notes
 
-This project depends on YouTube extraction through `yt-dlp`, so availability can change if YouTube changes its site behavior. Keeping `yt-dlp` updated is recommended.
+This project depends on YouTube extraction through `yt-dlp`, so availability can change if YouTube changes its site behavior. Keeping `yt-dlp` updated is recommended:
 
 ```powershell
 pip install --upgrade yt-dlp

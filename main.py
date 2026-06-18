@@ -11,7 +11,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Deque, Optional, Protocol
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 
 class CommandName:
@@ -75,7 +75,7 @@ class SilentYtdlpLogger:
 
 
 class TrackResolver(Protocol):
-    def resolve(self, query: str) -> Track:
+    def resolve(self, query: str) -> list[Track]:
         ...
 
     def prepare(
@@ -126,19 +126,19 @@ def parse_command(line: str) -> Command:
         return Command(exact_commands[lower])
 
     if lower == "m!p":
-        return Command(CommandName.INVALID, error='Use: m!p "nome da musica"')
+        return Command(CommandName.INVALID, error='Use: m!p <nome ou URL>')
 
     if lower.startswith("m!p "):
         argument = raw[4:].strip()
         if not argument:
-            return Command(CommandName.INVALID, error='Use: m!p "nome da musica"')
+            return Command(CommandName.INVALID, error='Use: m!p <nome ou URL>')
         try:
             parts = shlex.split(argument)
         except ValueError as exc:
             return Command(CommandName.INVALID, error=f"Comando com aspas invalidas: {exc}")
         query = " ".join(parts).strip()
         if not query:
-            return Command(CommandName.INVALID, error='Use: m!p "nome da musica"')
+            return Command(CommandName.INVALID, error='Use: m!p <nome ou URL>')
         return Command(CommandName.PLAY, query)
 
     return Command(CommandName.UNKNOWN, raw)
@@ -149,13 +149,24 @@ def is_http_url(value: str) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
+def is_playlist_url(value: str) -> bool:
+    if not is_http_url(value):
+        return False
+
+    parsed = urlparse(value)
+    query = parse_qs(parsed.query)
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    return "list" in query or ("youtube" in host and "/playlist" in path)
+
+
 class YouTubeTrackResolver:
     def __init__(self, temp_dir: Optional[Path] = None) -> None:
         self._owns_temp_dir = temp_dir is None
         self.temp_dir = temp_dir or Path(tempfile.mkdtemp(prefix="console_music_player_"))
         self.temp_dir.mkdir(parents=True, exist_ok=True)
 
-    def resolve(self, query: str) -> Track:
+    def resolve(self, query: str) -> list[Track]:
         try:
             import yt_dlp
         except ImportError as exc:
@@ -163,9 +174,11 @@ class YouTubeTrackResolver:
                 "Dependencias faltando. Rode: pip install -r requirements.txt"
             ) from exc
 
+        playlist_allowed = is_playlist_url(query)
         target = query if is_http_url(query) else f"ytsearch1:{query}"
         ydl_opts = {
-            "noplaylist": True,
+            "extract_flat": "in_playlist" if playlist_allowed else False,
+            "noplaylist": not playlist_allowed,
             "noprogress": True,
             "quiet": True,
             "no_warnings": True,
@@ -179,10 +192,10 @@ class YouTubeTrackResolver:
         except Exception as exc:
             raise RuntimeError(f"Nao consegui encontrar '{query}': {exc}") from exc
 
-        info = self._select_entry(info)
-        title = str(info.get("title") or query)
-        source_url = str(info.get("webpage_url") or info.get("original_url") or query)
-        return Track(query=query, title=title, source_url=source_url)
+        tracks = self._tracks_from_info(info, query, playlist_allowed)
+        if not tracks:
+            raise RuntimeError("Nenhum resultado encontrado no YouTube.")
+        return tracks
 
     def prepare(
         self,
@@ -342,6 +355,34 @@ class YouTubeTrackResolver:
 
         raise RuntimeError("Download terminou, mas o arquivo de audio nao foi encontrado.")
 
+    def _tracks_from_info(self, info: dict, query: str, playlist_allowed: bool) -> list[Track]:
+        if "entries" not in info:
+            return [self._track_from_entry(info, query)]
+
+        entries = [entry for entry in info.get("entries") or [] if entry]
+        if not entries:
+            return []
+
+        selected = entries if playlist_allowed else entries[:1]
+        return [self._track_from_entry(entry, query) for entry in selected]
+
+    def _track_from_entry(self, entry: dict, query: str) -> Track:
+        title = str(entry.get("title") or query)
+        source_url = self._entry_url(entry, query)
+        return Track(query=query, title=title, source_url=source_url)
+
+    def _entry_url(self, entry: dict, fallback: str) -> str:
+        for key in ("webpage_url", "original_url", "url"):
+            value = entry.get(key)
+            if isinstance(value, str) and is_http_url(value):
+                return value
+
+        video_id = entry.get("id") or entry.get("url")
+        if isinstance(video_id, str) and video_id:
+            return f"https://www.youtube.com/watch?v={video_id}"
+
+        return fallback
+
     def _select_entry(self, info: dict) -> dict:
         if "entries" not in info:
             return info
@@ -448,11 +489,17 @@ class MusicQueuePlayer:
             self._thread.start()
 
     def enqueue(self, track: Track) -> int:
+        return self.enqueue_many([track])
+
+    def enqueue_many(self, tracks: list[Track]) -> int:
+        if not tracks:
+            return 0
+
         with self._lock:
-            self._queue.append(track)
-            position = len(self._queue) + (1 if self._current else 0)
+            start_position = len(self._queue) + (1 if self._current else 0) + 1
+            self._queue.extend(tracks)
         self._item_event.set()
-        return position
+        return start_position
 
     def skip(self) -> bool:
         with self._lock:
@@ -549,7 +596,7 @@ def print_help() -> None:
         "\n".join(
             [
                 "Comandos:",
-                '  m!p "nome da musica"  adiciona uma musica do YouTube na fila',
+                '  m!p <nome ou URL>    adiciona musica/video/playlist do YouTube',
                 "  m!s                   para a musica atual e pula para a proxima",
                 "  m!fila                mostra a fila",
                 "  m!limpar              limpa a fila pendente",
@@ -571,12 +618,16 @@ def handle_command(command: Command, player: MusicQueuePlayer) -> bool:
         return True
     if command.name == CommandName.PLAY:
         try:
-            track = player.resolver.resolve(command.argument)
+            tracks = player.resolver.resolve(command.argument)
         except Exception as exc:
             print(f"Erro: {exc}")
             return True
-        position = player.enqueue(track)
-        print(f"{track.display_name} adicionado a fila (posicao {position})")
+
+        position = player.enqueue_many(tracks)
+        if len(tracks) == 1:
+            print(f"{tracks[0].display_name} adicionado a fila (posicao {position})")
+        else:
+            print(f"{len(tracks)} musicas adicionadas a fila (a partir da posicao {position})")
         return True
     if command.name == CommandName.SKIP:
         if player.skip():
