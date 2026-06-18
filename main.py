@@ -1,15 +1,14 @@
 from __future__ import annotations
 
+import ctypes
 import shlex
-import shutil
 import subprocess
-import tempfile
 import threading
 import time
 import uuid
 from collections import deque
+from ctypes import wintypes
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Callable, Deque, Optional, Protocol
 from urllib.parse import parse_qs, urlparse
 
@@ -17,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 class CommandName:
     PLAY = "play"
     SKIP = "skip"
+    SKIP_PLAYLIST = "skip_playlist"
     QUEUE = "queue"
     CLEAR = "clear"
     QUIT = "quit"
@@ -38,6 +38,8 @@ class Track:
     query: str
     title: str = ""
     source_url: str = ""
+    playlist_key: str = ""
+    playlist_title: str = ""
     requested_at: float = field(default_factory=time.time)
 
     @property
@@ -50,7 +52,8 @@ class PreparedTrack:
     track: Track
     title: str
     source_url: str
-    path: Path
+    audio_url: str
+    http_headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -96,7 +99,8 @@ class TrackResolver(Protocol):
 class AudioBackend(Protocol):
     def play(
         self,
-        path: Path,
+        audio_url: str,
+        http_headers: dict[str, str],
         stop_event: threading.Event,
         skip_event: threading.Event,
     ) -> None:
@@ -117,6 +121,8 @@ def parse_command(line: str) -> Command:
     lower = raw.lower()
     exact_commands = {
         "m!s": CommandName.SKIP,
+        "m!sp": CommandName.SKIP_PLAYLIST,
+        "m!splaylist": CommandName.SKIP_PLAYLIST,
         "m!fila": CommandName.QUEUE,
         "m!limpar": CommandName.CLEAR,
         "m!q": CommandName.QUIT,
@@ -126,19 +132,19 @@ def parse_command(line: str) -> Command:
         return Command(exact_commands[lower])
 
     if lower == "m!p":
-        return Command(CommandName.INVALID, error='Use: m!p <nome ou URL>')
+        return Command(CommandName.INVALID, error="Use: m!p <nome ou URL>")
 
     if lower.startswith("m!p "):
         argument = raw[4:].strip()
         if not argument:
-            return Command(CommandName.INVALID, error='Use: m!p <nome ou URL>')
+            return Command(CommandName.INVALID, error="Use: m!p <nome ou URL>")
         try:
             parts = shlex.split(argument)
         except ValueError as exc:
             return Command(CommandName.INVALID, error=f"Comando com aspas invalidas: {exc}")
         query = " ".join(parts).strip()
         if not query:
-            return Command(CommandName.INVALID, error='Use: m!p <nome ou URL>')
+            return Command(CommandName.INVALID, error="Use: m!p <nome ou URL>")
         return Command(CommandName.PLAY, query)
 
     return Command(CommandName.UNKNOWN, raw)
@@ -161,11 +167,6 @@ def is_playlist_url(value: str) -> bool:
 
 
 class YouTubeTrackResolver:
-    def __init__(self, temp_dir: Optional[Path] = None) -> None:
-        self._owns_temp_dir = temp_dir is None
-        self.temp_dir = temp_dir or Path(tempfile.mkdtemp(prefix="console_music_player_"))
-        self.temp_dir.mkdir(parents=True, exist_ok=True)
-
     def resolve(self, query: str) -> list[Track]:
         try:
             import yt_dlp
@@ -176,15 +177,13 @@ class YouTubeTrackResolver:
 
         playlist_allowed = is_playlist_url(query)
         target = query if is_http_url(query) else f"ytsearch1:{query}"
-        ydl_opts = {
-            "extract_flat": "in_playlist" if playlist_allowed else False,
-            "noplaylist": not playlist_allowed,
-            "noprogress": True,
-            "quiet": True,
-            "no_warnings": True,
-            "default_search": "ytsearch1",
-            "logger": SilentYtdlpLogger(),
-        }
+        ydl_opts = self._base_ytdlp_options()
+        ydl_opts.update(
+            {
+                "extract_flat": True,
+                "noplaylist": not playlist_allowed,
+            }
+        )
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -204,156 +203,70 @@ class YouTubeTrackResolver:
         stop_event: threading.Event,
     ) -> PreparedTrack:
         self._raise_if_cancelled(skip_event, stop_event)
-        input_path, title, source_url = self._download_audio(track, skip_event, stop_event)
+
         try:
-            self._raise_if_cancelled(skip_event, stop_event)
-            wav_path = self._convert_to_wav(input_path, skip_event, stop_event)
-        finally:
-            self._unlink_quietly(input_path)
-
-        return PreparedTrack(
-            track=track,
-            title=title or track.display_name,
-            source_url=source_url or track.source_url,
-            path=wav_path,
-        )
-
-    def cleanup(self, prepared: PreparedTrack) -> None:
-        self._unlink_quietly(prepared.path)
-
-    def close(self) -> None:
-        if self._owns_temp_dir:
-            shutil.rmtree(self.temp_dir, ignore_errors=True)
-
-    def _download_audio(
-        self,
-        track: Track,
-        skip_event: threading.Event,
-        stop_event: threading.Event,
-    ) -> tuple[Path, str, str]:
-        try:
-            import imageio_ffmpeg
             import yt_dlp
         except ImportError as exc:
             raise RuntimeError(
                 "Dependencias faltando. Rode: pip install -r requirements.txt"
             ) from exc
 
-        downloaded_files: list[Path] = []
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         target = track.source_url or (
             track.query if is_http_url(track.query) else f"ytsearch1:{track.query}"
         )
+        ydl_opts = self._base_ytdlp_options()
+        ydl_opts.update(
+            {
+                "format": "bestaudio[ext=m4a]/bestaudio/best",
+                "noplaylist": True,
+            }
+        )
 
-        def progress_hook(data: dict) -> None:
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(target, download=False)
+        except Exception as exc:
             if skip_event.is_set() or stop_event.is_set():
-                raise PlaybackSkipped()
-            if data.get("status") == "finished" and data.get("filename"):
-                downloaded_files.append(Path(data["filename"]))
+                raise PlaybackSkipped() from exc
+            raise RuntimeError(f"Nao consegui abrir '{track.display_name}': {exc}") from exc
 
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": str(self.temp_dir / "%(id)s.%(ext)s"),
-            "noplaylist": True,
+        self._raise_if_cancelled(skip_event, stop_event)
+        info = self._select_entry(info)
+        audio_format = self._pick_audio_format(info)
+        if not audio_format or not audio_format.get("url"):
+            raise RuntimeError(f"Nao encontrei um audio tocavel para '{track.display_name}'.")
+
+        headers: dict[str, str] = {}
+        headers.update(info.get("http_headers") or {})
+        headers.update(audio_format.get("http_headers") or {})
+        title = str(info.get("title") or track.display_name)
+        source_url = str(info.get("webpage_url") or info.get("original_url") or track.source_url)
+
+        return PreparedTrack(
+            track=track,
+            title=title,
+            source_url=source_url,
+            audio_url=str(audio_format["url"]),
+            http_headers=headers,
+        )
+
+    def cleanup(self, _prepared: PreparedTrack) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def _base_ytdlp_options(self) -> dict:
+        return {
             "noprogress": True,
             "quiet": True,
             "no_warnings": True,
             "default_search": "ytsearch1",
-            "ffmpeg_location": ffmpeg_exe,
+            "socket_timeout": 10,
+            "retries": 3,
+            "fragment_retries": 3,
             "logger": SilentYtdlpLogger(),
-            "progress_hooks": [progress_hook],
         }
-
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(target, download=True)
-        except PlaybackSkipped:
-            raise
-        except Exception as exc:
-            if skip_event.is_set() or stop_event.is_set():
-                raise PlaybackSkipped() from exc
-            raise RuntimeError(f"Nao consegui baixar '{track.display_name}': {exc}") from exc
-
-        self._raise_if_cancelled(skip_event, stop_event)
-        info = self._select_entry(info)
-        title = str(info.get("title") or track.display_name)
-        source_url = str(info.get("webpage_url") or info.get("original_url") or track.source_url)
-        input_path = self._find_downloaded_file(downloaded_files, info)
-        return input_path, title, source_url
-
-    def _convert_to_wav(
-        self,
-        input_path: Path,
-        skip_event: threading.Event,
-        stop_event: threading.Event,
-    ) -> Path:
-        try:
-            import imageio_ffmpeg
-        except ImportError as exc:
-            raise RuntimeError(
-                "Dependencias faltando. Rode: pip install -r requirements.txt"
-            ) from exc
-
-        output_path = self.temp_dir / f"{uuid.uuid4().hex}.wav"
-        command = [
-            imageio_ffmpeg.get_ffmpeg_exe(),
-            "-y",
-            "-i",
-            str(input_path),
-            "-vn",
-            "-acodec",
-            "pcm_s16le",
-            "-ar",
-            "44100",
-            "-ac",
-            "2",
-            str(output_path),
-        ]
-
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            creationflags=creationflags,
-        )
-        try:
-            while process.poll() is None:
-                if skip_event.is_set() or stop_event.is_set():
-                    process.terminate()
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                    raise PlaybackSkipped()
-                time.sleep(0.1)
-
-            stdout, stderr = process.communicate()
-            if process.returncode != 0:
-                message = (stderr or stdout).decode("utf-8", errors="replace").strip()
-                raise RuntimeError(f"FFmpeg falhou ao converter o audio: {message}")
-        except Exception:
-            self._unlink_quietly(output_path)
-            raise
-
-        return output_path
-
-    def _find_downloaded_file(self, downloaded_files: list[Path], info: dict) -> Path:
-        existing = [path for path in downloaded_files if path.exists()]
-        if existing:
-            return existing[-1]
-
-        requested_downloads = info.get("requested_downloads") or []
-        for item in requested_downloads:
-            filepath = item.get("filepath") or item.get("filename")
-            if filepath and Path(filepath).exists():
-                return Path(filepath)
-
-        fallback = self.temp_dir / f"{info.get('id')}.{info.get('ext')}"
-        if fallback.exists():
-            return fallback
-
-        raise RuntimeError("Download terminou, mas o arquivo de audio nao foi encontrado.")
 
     def _tracks_from_info(self, info: dict, query: str, playlist_allowed: bool) -> list[Track]:
         if "entries" not in info:
@@ -363,13 +276,36 @@ class YouTubeTrackResolver:
         if not entries:
             return []
 
-        selected = entries if playlist_allowed else entries[:1]
-        return [self._track_from_entry(entry, query) for entry in selected]
+        playlist_key = ""
+        playlist_title = ""
+        selected = entries[:1]
+        if playlist_allowed:
+            playlist_id = str(info.get("id") or uuid.uuid4().hex)
+            playlist_key = f"playlist:{playlist_id}"
+            playlist_title = str(info.get("title") or "YouTube playlist")
+            selected = entries
 
-    def _track_from_entry(self, entry: dict, query: str) -> Track:
+        return [
+            self._track_from_entry(entry, query, playlist_key, playlist_title)
+            for entry in selected
+        ]
+
+    def _track_from_entry(
+        self,
+        entry: dict,
+        query: str,
+        playlist_key: str = "",
+        playlist_title: str = "",
+    ) -> Track:
         title = str(entry.get("title") or query)
         source_url = self._entry_url(entry, query)
-        return Track(query=query, title=title, source_url=source_url)
+        return Track(
+            query=query,
+            title=title,
+            source_url=source_url,
+            playlist_key=playlist_key,
+            playlist_title=playlist_title,
+        )
 
     def _entry_url(self, entry: dict, fallback: str) -> str:
         for key in ("webpage_url", "original_url", "url"):
@@ -392,6 +328,30 @@ class YouTubeTrackResolver:
                 return entry
         raise RuntimeError("Nenhum resultado encontrado no YouTube.")
 
+    def _pick_audio_format(self, info: dict) -> Optional[dict]:
+        candidates: list[dict] = []
+
+        if info.get("url") and info.get("acodec") and info.get("acodec") != "none":
+            candidates.append(info)
+
+        for item in info.get("formats") or []:
+            if not item.get("url"):
+                continue
+            if not item.get("acodec") or item.get("acodec") == "none":
+                continue
+            if item.get("vcodec") and item.get("vcodec") != "none":
+                continue
+            candidates.append(item)
+
+        candidates.sort(
+            key=lambda item: (
+                1 if item.get("ext") == "m4a" else 0,
+                float(item.get("abr") or 0),
+            ),
+            reverse=True,
+        )
+        return candidates[0] if candidates else None
+
     def _raise_if_cancelled(
         self,
         skip_event: threading.Event,
@@ -400,64 +360,366 @@ class YouTubeTrackResolver:
         if skip_event.is_set() or stop_event.is_set():
             raise PlaybackSkipped()
 
-    def _unlink_quietly(self, path: Path) -> None:
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
+
+class WaveFormatEx(ctypes.Structure):
+    _fields_ = [
+        ("wFormatTag", wintypes.WORD),
+        ("nChannels", wintypes.WORD),
+        ("nSamplesPerSec", wintypes.DWORD),
+        ("nAvgBytesPerSec", wintypes.DWORD),
+        ("nBlockAlign", wintypes.WORD),
+        ("wBitsPerSample", wintypes.WORD),
+        ("cbSize", wintypes.WORD),
+    ]
 
 
-class WinsoundAudioBackend:
-    def __init__(self) -> None:
+class WaveHeader(ctypes.Structure):
+    _fields_ = [
+        ("lpData", ctypes.c_void_p),
+        ("dwBufferLength", wintypes.DWORD),
+        ("dwBytesRecorded", wintypes.DWORD),
+        ("dwUser", ctypes.c_void_p),
+        ("dwFlags", wintypes.DWORD),
+        ("dwLoops", wintypes.DWORD),
+        ("lpNext", ctypes.c_void_p),
+        ("reserved", ctypes.c_void_p),
+    ]
+
+
+class FfmpegWaveOutAudioBackend:
+    WAVE_FORMAT_PCM = 1
+    WAVE_MAPPER = 0xFFFFFFFF
+    CALLBACK_NULL = 0
+    WHDR_DONE = 0x00000001
+    BUFFER_SIZE = 32768
+    MAX_PENDING_BUFFERS = 8
+
+    def __init__(self, sample_rate: int = 44100, channels: int = 2) -> None:
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.bits_per_sample = 16
+        self.block_align = self.channels * self.bits_per_sample // 8
         self._lock = threading.Lock()
+        self._process: Optional[subprocess.Popen] = None
+        self._wave_handle: Optional[ctypes.c_void_p] = None
+        self._winmm = self._load_winmm()
 
     def play(
         self,
-        path: Path,
+        audio_url: str,
+        http_headers: dict[str, str],
         stop_event: threading.Event,
         skip_event: threading.Event,
     ) -> None:
-        try:
-            import winsound
-        except ImportError as exc:
-            raise RuntimeError("Este backend de audio funciona no Windows.") from exc
+        command = self._build_ffmpeg_command(audio_url, http_headers)
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=creationflags,
+        )
+        wave_handle = self._open_wave_out()
+        pending: list[tuple[ctypes.Array, WaveHeader]] = []
+        carry = b""
 
-        duration = self._wav_duration(path)
         with self._lock:
-            winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+            self._process = process
+            self._wave_handle = wave_handle
 
-        deadline = time.monotonic() + duration
         try:
-            while time.monotonic() < deadline:
+            stdout = process.stdout
+            if stdout is None:
+                raise RuntimeError("FFmpeg nao abriu o audio.")
+
+            while not stop_event.is_set() and not skip_event.is_set():
+                self._drain_done_buffers(wave_handle, pending)
+                self._wait_for_buffer_room(wave_handle, pending, stop_event, skip_event)
                 if stop_event.is_set() or skip_event.is_set():
-                    self.stop()
                     break
-                time.sleep(0.05)
-        finally:
+
+                chunk = stdout.read(self.BUFFER_SIZE)
+                if not chunk:
+                    break
+
+                chunk = carry + chunk
+                usable_length = len(chunk) - (len(chunk) % self.block_align)
+                if usable_length:
+                    self._write_chunk(wave_handle, chunk[:usable_length], pending)
+                carry = chunk[usable_length:]
+
             if stop_event.is_set() or skip_event.is_set():
-                self.stop()
+                self._reset_wave_out(wave_handle)
+                self._terminate_process(process)
+                raise PlaybackSkipped()
+
+            return_code = process.wait(timeout=5)
+            if return_code != 0:
+                stderr = self._read_stderr(process)
+                raise RuntimeError(f"FFmpeg falhou ao tocar o audio: {stderr}")
+
+            while pending and not stop_event.is_set() and not skip_event.is_set():
+                self._drain_done_buffers(wave_handle, pending)
+                if pending:
+                    time.sleep(0.02)
+        finally:
+            if pending or stop_event.is_set() or skip_event.is_set():
+                self._reset_wave_out(wave_handle)
+            self._terminate_process(process)
+            self._unprepare_all(wave_handle, pending)
+            self._close_wave_out(wave_handle)
+            with self._lock:
+                if self._process is process:
+                    self._process = None
+                if self._wave_handle is wave_handle:
+                    self._wave_handle = None
 
     def stop(self) -> None:
-        try:
-            import winsound
-        except ImportError:
-            return
-
         with self._lock:
-            winsound.PlaySound(None, 0)
+            process = self._process
+            wave_handle = self._wave_handle
+
+        if wave_handle is not None:
+            self._reset_wave_out(wave_handle)
+        if process is not None:
+            self._terminate_process(process)
 
     def close(self) -> None:
         self.stop()
 
-    def _wav_duration(self, path: Path) -> float:
-        import wave
+    def _build_ffmpeg_command(self, audio_url: str, http_headers: dict[str, str]) -> list[str]:
+        try:
+            import imageio_ffmpeg
+        except ImportError as exc:
+            raise RuntimeError(
+                "Dependencias faltando. Rode: pip install -r requirements.txt"
+            ) from exc
 
-        with wave.open(str(path), "rb") as wav_file:
-            frames = wav_file.getnframes()
-            rate = wav_file.getframerate()
-            if rate <= 0:
-                raise RuntimeError("Arquivo WAV invalido.")
-            return frames / float(rate)
+        command = [
+            imageio_ffmpeg.get_ffmpeg_exe(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "5",
+        ]
+
+        header_text = self._format_ffmpeg_headers(http_headers)
+        if header_text:
+            command.extend(["-headers", header_text])
+
+        command.extend(
+            [
+                "-i",
+                audio_url,
+                "-vn",
+                "-f",
+                "s16le",
+                "-acodec",
+                "pcm_s16le",
+                "-ar",
+                str(self.sample_rate),
+                "-ac",
+                str(self.channels),
+                "pipe:1",
+            ]
+        )
+        return command
+
+    def _format_ffmpeg_headers(self, headers: dict[str, str]) -> str:
+        return "".join(f"{key}: {value}\r\n" for key, value in headers.items() if value)
+
+    def _load_winmm(self):
+        try:
+            winmm = ctypes.WinDLL("winmm")
+        except AttributeError as exc:
+            raise RuntimeError("Este backend de audio funciona no Windows.") from exc
+
+        winmm.waveOutOpen.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            wintypes.UINT,
+            ctypes.POINTER(WaveFormatEx),
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        winmm.waveOutOpen.restype = wintypes.UINT
+        winmm.waveOutPrepareHeader.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(WaveHeader),
+            wintypes.UINT,
+        ]
+        winmm.waveOutPrepareHeader.restype = wintypes.UINT
+        winmm.waveOutWrite.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(WaveHeader),
+            wintypes.UINT,
+        ]
+        winmm.waveOutWrite.restype = wintypes.UINT
+        winmm.waveOutUnprepareHeader.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(WaveHeader),
+            wintypes.UINT,
+        ]
+        winmm.waveOutUnprepareHeader.restype = wintypes.UINT
+        winmm.waveOutReset.argtypes = [ctypes.c_void_p]
+        winmm.waveOutReset.restype = wintypes.UINT
+        winmm.waveOutClose.argtypes = [ctypes.c_void_p]
+        winmm.waveOutClose.restype = wintypes.UINT
+        winmm.waveOutGetErrorTextW.argtypes = [
+            wintypes.UINT,
+            wintypes.LPWSTR,
+            wintypes.UINT,
+        ]
+        winmm.waveOutGetErrorTextW.restype = wintypes.UINT
+        return winmm
+
+    def _open_wave_out(self) -> ctypes.c_void_p:
+        fmt = WaveFormatEx(
+            wFormatTag=self.WAVE_FORMAT_PCM,
+            nChannels=self.channels,
+            nSamplesPerSec=self.sample_rate,
+            nAvgBytesPerSec=self.sample_rate * self.block_align,
+            nBlockAlign=self.block_align,
+            wBitsPerSample=self.bits_per_sample,
+            cbSize=0,
+        )
+        handle = ctypes.c_void_p()
+        result = self._winmm.waveOutOpen(
+            ctypes.byref(handle),
+            self.WAVE_MAPPER,
+            ctypes.byref(fmt),
+            0,
+            0,
+            self.CALLBACK_NULL,
+        )
+        self._check_result(result, "abrir audio do Windows")
+        return handle
+
+    def _write_chunk(
+        self,
+        wave_handle: ctypes.c_void_p,
+        chunk: bytes,
+        pending: list[tuple[ctypes.Array, WaveHeader]],
+    ) -> None:
+        data = ctypes.create_string_buffer(chunk)
+        header = WaveHeader(
+            lpData=ctypes.cast(data, ctypes.c_void_p).value,
+            dwBufferLength=len(chunk),
+            dwBytesRecorded=0,
+            dwUser=None,
+            dwFlags=0,
+            dwLoops=0,
+            lpNext=None,
+            reserved=None,
+        )
+        header_size = ctypes.sizeof(header)
+        self._check_result(
+            self._winmm.waveOutPrepareHeader(wave_handle, ctypes.byref(header), header_size),
+            "preparar buffer de audio",
+        )
+        try:
+            self._check_result(
+                self._winmm.waveOutWrite(wave_handle, ctypes.byref(header), header_size),
+                "enviar audio para o Windows",
+            )
+        except Exception:
+            self._winmm.waveOutUnprepareHeader(wave_handle, ctypes.byref(header), header_size)
+            raise
+        pending.append((data, header))
+
+    def _wait_for_buffer_room(
+        self,
+        wave_handle: ctypes.c_void_p,
+        pending: list[tuple[ctypes.Array, WaveHeader]],
+        stop_event: threading.Event,
+        skip_event: threading.Event,
+    ) -> None:
+        while len(pending) >= self.MAX_PENDING_BUFFERS:
+            if stop_event.is_set() or skip_event.is_set():
+                return
+            self._drain_done_buffers(wave_handle, pending)
+            if len(pending) >= self.MAX_PENDING_BUFFERS:
+                time.sleep(0.015)
+
+    def _drain_done_buffers(
+        self,
+        wave_handle: ctypes.c_void_p,
+        pending: list[tuple[ctypes.Array, WaveHeader]],
+    ) -> None:
+        still_pending: list[tuple[ctypes.Array, WaveHeader]] = []
+        for data, header in pending:
+            if header.dwFlags & self.WHDR_DONE:
+                self._winmm.waveOutUnprepareHeader(
+                    wave_handle,
+                    ctypes.byref(header),
+                    ctypes.sizeof(header),
+                )
+            else:
+                still_pending.append((data, header))
+        pending[:] = still_pending
+
+    def _unprepare_all(
+        self,
+        wave_handle: ctypes.c_void_p,
+        pending: list[tuple[ctypes.Array, WaveHeader]],
+    ) -> None:
+        for _data, header in pending:
+            self._winmm.waveOutUnprepareHeader(
+                wave_handle,
+                ctypes.byref(header),
+                ctypes.sizeof(header),
+            )
+        pending.clear()
+
+    def _reset_wave_out(self, wave_handle: ctypes.c_void_p) -> None:
+        try:
+            self._winmm.waveOutReset(wave_handle)
+        except Exception:
+            pass
+
+    def _close_wave_out(self, wave_handle: ctypes.c_void_p) -> None:
+        try:
+            self._winmm.waveOutClose(wave_handle)
+        except Exception:
+            pass
+
+    def _terminate_process(self, process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+
+    def _read_stderr(self, process: subprocess.Popen) -> str:
+        stderr = b""
+        if process.stderr is not None:
+            try:
+                stderr = process.stderr.read() or b""
+            except Exception:
+                stderr = b""
+        return stderr.decode("utf-8", errors="replace").strip() or "erro desconhecido"
+
+    def _check_result(self, result: int, action: str) -> None:
+        if result != 0:
+            raise RuntimeError(f"Falha ao {action}: {self._wave_error_text(result)}")
+
+    def _wave_error_text(self, result: int) -> str:
+        buffer = ctypes.create_unicode_buffer(256)
+        try:
+            self._winmm.waveOutGetErrorTextW(result, buffer, len(buffer))
+        except Exception:
+            return f"codigo {result}"
+        return buffer.value or f"codigo {result}"
 
 
 class MusicQueuePlayer:
@@ -512,6 +774,24 @@ class MusicQueuePlayer:
         self.audio_backend.stop()
         return True
 
+    def skip_playlist(self) -> tuple[bool, int]:
+        with self._lock:
+            current = self._current
+            if current is None:
+                return False, 0
+
+            removed = 0
+            if current.playlist_key:
+                before = len(self._queue)
+                self._queue = deque(
+                    track for track in self._queue if track.playlist_key != current.playlist_key
+                )
+                removed = before - len(self._queue)
+
+        self._skip_event.set()
+        self.audio_backend.stop()
+        return True, removed
+
     def clear_queue(self) -> int:
         with self._lock:
             removed = len(self._queue)
@@ -533,7 +813,7 @@ class MusicQueuePlayer:
         if not self._thread.is_alive():
             self.resolver.close()
         else:
-            self.say("Download ainda encerrando; alguns temporarios podem ficar para limpeza do sistema.")
+            self.say("Player ainda encerrando; tente fechar de novo se o audio continuar.")
 
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -559,7 +839,12 @@ class MusicQueuePlayer:
                         raise PlaybackSkipped()
 
                     self.say(f"Tocando: {track.display_name}")
-                    self.audio_backend.play(prepared.path, self._stop_event, self._skip_event)
+                    self.audio_backend.play(
+                        prepared.audio_url,
+                        prepared.http_headers,
+                        self._stop_event,
+                        self._skip_event,
+                    )
                 except PlaybackSkipped:
                     pass
                 except Exception as exc:
@@ -596,8 +881,10 @@ def print_help() -> None:
         "\n".join(
             [
                 "Comandos:",
-                '  m!p <nome ou URL>    adiciona musica/video/playlist do YouTube',
+                "  m!p <nome ou URL>    adiciona musica/video/playlist do YouTube",
                 "  m!s                   para a musica atual e pula para a proxima",
+                "  m!sp                  pula a playlist atual",
+                "  m!splaylist           igual ao m!sp",
                 "  m!fila                mostra a fila",
                 "  m!limpar              limpa a fila pendente",
                 "  m!q                   sai do player",
@@ -635,6 +922,16 @@ def handle_command(command: Command, player: MusicQueuePlayer) -> bool:
         else:
             print("Nada tocando agora.")
         return True
+    if command.name == CommandName.SKIP_PLAYLIST:
+        skipped, removed = player.skip_playlist()
+        if skipped:
+            if removed:
+                print(f"Pulando playlist atual... {removed} musica(s) removida(s).")
+            else:
+                print("Pulando musica atual...")
+        else:
+            print("Nada tocando agora.")
+        return True
     if command.name == CommandName.QUEUE:
         print(format_queue(player.snapshot()))
         return True
@@ -668,7 +965,7 @@ def make_prompt_reader(prompt: str = "> ") -> Callable[[], str]:
 
 
 def main() -> None:
-    player = MusicQueuePlayer(YouTubeTrackResolver(), WinsoundAudioBackend())
+    player = MusicQueuePlayer(YouTubeTrackResolver(), FfmpegWaveOutAudioBackend())
     player.start()
     read_line = make_prompt_reader()
 

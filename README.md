@@ -10,15 +10,17 @@ A small Windows console music player written in Python. It searches YouTube, res
 - Shows the resolved YouTube title before adding tracks to the queue.
 - Queue support: add multiple songs and play them in order.
 - Skip the current track with `m!s`.
-- Quiet download/conversion output.
+- Skip the current playlist with `m!sp` or `m!splaylist`.
+- Faster playback startup: streams audio instead of downloading and converting a full WAV first.
+- Quiet playback setup output.
 - Clean interactive prompt powered by `prompt-toolkit`.
 - No `pygame`, VLC, mpv, or ffplay dependency.
 
 ## Platform Support
 
-Playback currently works on **Windows only** because the audio backend uses Python's built-in `winsound` module.
+Playback currently works on **Windows only** because the audio backend streams decoded PCM directly to Windows `waveOut` through `winmm`.
 
-The YouTube search/download parts are cross-platform, but Linux/macOS playback would need a different audio backend such as `simpleaudio`, `sounddevice`, or `miniaudio`.
+The YouTube search/stream resolving parts are cross-platform, but Linux/macOS playback would need a different audio backend such as `simpleaudio`, `sounddevice`, or `miniaudio`.
 
 ## Requirements
 
@@ -91,6 +93,8 @@ For playlist links, the player adds all playlist tracks to the pending queue and
 | `m!p <video URL>` | Add a direct YouTube video to the queue. |
 | `m!p <playlist URL>` | Add all videos from a YouTube playlist to the queue. |
 | `m!s` | Stop the current track and skip to the next one. |
+| `m!sp` | Skip the current playlist and remove the rest of it from the queue. |
+| `m!splaylist` | Same as `m!sp`. |
 | `m!fila` | Show the current track and queued songs. |
 | `m!limpar` | Clear the pending queue without stopping the current track. |
 | `m!help` | Show available commands. |
@@ -100,10 +104,10 @@ For playlist links, the player adds all playlist tracks to the pending queue and
 
 1. `yt-dlp` searches YouTube or reads the provided YouTube URL.
 2. Song searches and video links add one track; playlist links add all playlist entries.
-3. The selected audio is downloaded quietly.
-4. `imageio-ffmpeg` converts the audio to a temporary WAV file.
-5. `winsound` plays the WAV file.
-6. The temporary file is removed after playback.
+3. When a track starts, `yt-dlp` resolves the direct audio stream URL.
+4. `imageio-ffmpeg` decodes that stream to raw PCM in real time.
+5. Python sends the PCM buffers directly to Windows `waveOut`.
+6. No full audio download or temporary WAV conversion is needed before playback starts.
 
 ## Basic Check
 
